@@ -1,0 +1,65 @@
+name: hospital-tech
+description: >-
+  Find a piece of tech missing from hospitals that frontline clinical and
+  biomedical staff wish existed. Mines candid complaints, manual workarounds,
+  and "I wish there was..." moments across medical subreddits.
+
+subreddits:
+  - nursing
+  - medicine
+  - hospitalist
+  - healthIT
+  - BMET                # biomedical equipment technicians
+  - medicaldevices
+  - respiratorytherapy
+  - emergencymedicine
+  - Residency
+  - CRNA
+  - nursepractitioner
+  - medlabprofessionals
+  - Paramedics
+  - ems
+
+search_terms:
+  - "i wish there was"
+  - "still fax"
+  - "no system to"
+  - "no way to"
+  - "workaround"
+  - "double charting"
+  - "why do we still"
+  - "by hand"
+  - "manual"
+
+time_window: year        # hour|day|week|month|year|all
+listing_limit: 100       # posts per sub pulled in stage 1
+max_threads: 60          # stage-2 comment-tree fetch budget
+
+# Deterministic weighted lexicon. Each item's pain_score = sum of matched
+# weights. Patterns are regex, matched case-insensitively.
+pain_lexicon:
+  - { pattern: "i wish (there was|we had|they made|someone)", w: 3 }
+  - { pattern: "still (fax|faxing|paper|on paper|by hand|hand-?writ)", w: 3 }
+  - { pattern: "no (way|tool|app|system|software|device) to", w: 2 }
+  - { pattern: "why (is there no|isn'?t there|do we still|can'?t we)", w: 2 }
+  - { pattern: "(work[- ]?around|double (entry|charting|documentation))", w: 2 }
+  - { pattern: "wastes? (so much )?time", w: 2 }
+  - { pattern: "(have to|having to) (print|re-?enter|re-?type|call|walk)", w: 2 }
+  - { pattern: "(clunky|outdated|broken|archaic|stone age)", w: 1 }
+  - { pattern: "takes (forever|hours|ages|so long)", w: 1 }
+  - { pattern: "manual(ly)?", w: 1 }
+  - { pattern: "(pager|fax machine)", w: 1 }
+  - { pattern: "(epic|cerner|meditech|the ehr|the emr) (won'?t|can'?t|doesn'?t|makes)", w: 2 }
+
+pain_threshold: 3        # gates stage-2 deep fetch + ranking eligibility
+
+# The trust contract: a gap may not be emitted unless it clears all three.
+evidence:
+  min_items: 5
+  min_subreddits: 3
+  min_authors: 3
+
+comments:
+  max_per_thread: 40
+  min_score: 2
+  depth: 2

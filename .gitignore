@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# prospector runtime
+*.db
+*.sqlite
+*.sqlite3
+.cache/
+cache/
+reports/*.md
+!reports/.gitkeep
+
+# env / secrets
+.env
+.env.*
+
+# tooling
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

@@ -1,0 +1,54 @@
+name: saas-pain
+description: >-
+  Example second profile proving plug-and-play reuse. Mines developer and
+  founder subreddits for unmet software/tooling needs — the gaps people would
+  pay for. Demonstrates that swapping the niche is YAML-only, no code change.
+
+subreddits:
+  - SaaS
+  - Entrepreneur
+  - smallbusiness
+  - webdev
+  - devops
+  - sysadmin
+  - selfhosted
+  - ExperiencedDevs
+  - msp
+
+search_terms:
+  - "i wish there was"
+  - "is there a tool"
+  - "no good tool"
+  - "build this"
+  - "would pay for"
+  - "frustrating"
+  - "manual"
+  - "spreadsheet"
+
+time_window: year
+listing_limit: 100
+max_threads: 50
+
+pain_lexicon:
+  - { pattern: "i wish (there was|we had|someone (made|built))", w: 3 }
+  - { pattern: "would (gladly )?pay for", w: 3 }
+  - { pattern: "is there (a|any) (tool|app|service|software) (to|that|for)", w: 2 }
+  - { pattern: "no (good|decent|real) (tool|app|solution|option)", w: 2 }
+  - { pattern: "why (is there no|isn'?t there|do we still)", w: 2 }
+  - { pattern: "(work[- ]?around|stuck (with|using) (a )?spreadsheet)", w: 2 }
+  - { pattern: "(doing it|tracking (it|this)) (manual(ly)?|in (excel|sheets))", w: 2 }
+  - { pattern: "(clunky|bloated|overpriced|outdated)", w: 1 }
+  - { pattern: "(hate|frustrat|painful|nightmare)", w: 1 }
+  - { pattern: "takes (forever|hours|ages|so long)", w: 1 }
+
+pain_threshold: 3
+
+evidence:
+  min_items: 5
+  min_subreddits: 3
+  min_authors: 3
+
+comments:
+  max_per_thread: 40
+  min_score: 2
+  depth: 2

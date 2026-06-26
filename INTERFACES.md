@@ -252,7 +252,8 @@ def render_report(profile: Profile, store: Store, *, analyze: bool = False,
                   model: str = "auto", generated: str | None = None) -> str:
     """Return a Markdown report. Default (analyze=False): stats-only clusters
     from build_clusters, each with confidence, breadth (N items / M subs / K
-    authors), and 3-5 verbatim quotes w/ permalinks. With analyze=True: call
+    authors), and verbatim quotes w/ permalinks (all evidence for small
+    clusters; capped ~8). With analyze=True: call
     analyze.synthesize(clusters, profile, model) to add a one-paragraph thesis
     per gap — but STILL pass every gap through evidence_ok and only cite the
     evidence objects provided (no invented links). Always include the standing

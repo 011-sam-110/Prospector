@@ -2,7 +2,7 @@
 
 These run without any live network or LLM: ``reddit_search`` / ``reddit_sweep``
 are never exercised against real Reddit. We verify that (1) the module imports and
-exposes ``mcp`` + ``main``, (2) all nine contract tools are registered with the
+exposes ``mcp`` + ``main``, (2) all eleven contract tools are registered with the
 exact names Claude relies on, and (3) a stubbed read tool (``reddit_profiles``)
 flows through end-to-end via an in-memory client.
 
@@ -33,6 +33,8 @@ EXPECTED_TOOLS = {
     "reddit_get_evidence",
     "reddit_stats",
     "reddit_export",
+    "reddit_semantic_search",
+    "reddit_clusters",
 }
 
 
@@ -76,8 +78,8 @@ def test_module_exposes_server_and_main():
     assert callable(mcp_server.main)
 
 
-def test_all_nine_tools_registered():
-    """Exactly the nine contract tools are registered on the server."""
+def test_all_contract_tools_registered():
+    """Exactly the eleven contract tools are registered on the server."""
     names = _registered_tool_names()
     missing = EXPECTED_TOOLS - names
     assert not missing, f"missing tools: {sorted(missing)}"
@@ -163,3 +165,59 @@ def test_reddit_profiles_tool_flows_through_stub(monkeypatch):
         payload = payload["result"]
 
     assert payload == ["hospital-tech", "fake-niche"]
+
+
+def _payload(result):
+    payload = getattr(result, "data", None)
+    if payload is None:
+        payload = getattr(result, "structured_content", None)
+    if payload is None and hasattr(result, "content"):
+        import json
+
+        payload = json.loads(result.content[0].text)
+    if isinstance(payload, dict) and "result" in payload:
+        payload = payload["result"]
+    return payload
+
+
+def test_semantic_tools_return_permalinks_and_quotes(monkeypatch, tmp_path):
+    """reddit_semantic_search and reddit_clusters answer from stored vectors."""
+    pytest.importorskip("sqlite_vec")
+    pytest.importorskip("numpy")
+    from fastmcp import Client
+
+    from prospector import semantic
+    from prospector.store import Store
+    from semantic_fakes import NOW, FakeEmbedder, make_item
+
+    fake = FakeEmbedder()
+    monkeypatch.setattr(semantic, "default_embedder", lambda: fake)
+    store = Store(tmp_path / "m.db")
+    store.upsert_items(
+        [
+            make_item("t3_a", "we still fax discharge forms", title="Fax forms"),
+            make_item("t3_b", "the pager beeps all night", title="Pager"),
+            make_item("t1_c", "the fax machine jammed again", link_id="t3_a"),
+        ]
+    )
+    semantic.embed_pending(store.conn, fake, now=NOW)
+    monkeypatch.setattr(mcp_server, "_store", store)
+
+    async def _call():
+        async with Client(mcp_server.mcp) as client:
+            hits = await client.call_tool(
+                "reddit_semantic_search", {"query": "fax forms", "limit": 2}
+            )
+            groups = await client.call_tool("reddit_clusters", {"k": 2, "examples": 1})
+            return _payload(hits), _payload(groups)
+
+    hits, groups = asyncio.run(_call())
+    assert len(hits) == 2
+    for hit in hits:
+        assert hit["permalink"].startswith("https://www.reddit.com/")
+        assert hit["quote"]
+    assert sum(g["size"] for g in groups) == 3
+    for group in groups:
+        assert group["examples"][0]["permalink"].startswith("https://www.reddit.com/")
+        assert group["examples"][0]["quote"]
+    store.close()

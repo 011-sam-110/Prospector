@@ -14,7 +14,11 @@ prospector/
   models.py          # done — Item, Match, LexiconRule, Profile, EvidenceThresholds,
                      #        CommentConfig, EvidenceItem, SweepResult
   profiles.py        # done — load_profile(), list_profiles(), resolve_profiles_dir()
+  errors.py          # RedditError (shared by both transports)
   reddit_client.py   # AGENT A
+  reddit_rss.py      # RSS transport (fallback after a .json 403)
+  prune.py           # retention + deleted-content removal
+  semantic.py        # vectors, semantic search, clusters ([semantic] extra)
   store.py           # AGENT B
   scorer.py          # AGENT C
   scrape.py          # AGENT D
@@ -81,7 +85,7 @@ resolve_profiles_dir(profiles_dir: Path|None=None) -> Path
 A thin, polite client over Reddit's public `.json` endpoints, with optional OAuth.
 
 ```python
-DEFAULT_USER_AGENT = "prospector/0.1 (+https://github.com/011-sam-110/Prospector)"
+DEFAULT_USER_AGENT = "python:prospector:0.2 (personal research; +https://github.com/011-sam-110/Prospector)"
 
 class RedditClient:
     def __init__(self,
@@ -92,10 +96,17 @@ class RedditClient:
                  client_secret: str | None = None,       # falls back to env REDDIT_CLIENT_SECRET
                  min_interval: float | None = None,      # min seconds between requests;
                                                          # default 6.0 unauth, 0.6 with OAuth
-                 timeout: float = 20.0): ...
+                 timeout: float = 20.0,
+                 transport: str = "auto",                # auto | json | rss
+                 rss_interval: float | None = None,      # min seconds between RSS requests (20)
+                 log: Callable[[str], object] | None = None): ...  # default: stderr
 
     @property
     def authenticated(self) -> bool: ...   # True if OAuth creds present + token obtained
+    @property
+    def using_rss(self) -> bool: ...        # True once the client reads the RSS feeds
+    @property
+    def transport_in_use(self) -> str: ...  # "json" | "rss"
 
     def get_json(self, path: str, params: dict | None = None) -> dict:
         """Core fetch. `path` is e.g. '/r/nursing/.json' or '/r/x/comments/abc.json'.
@@ -121,7 +132,18 @@ class RedditClient:
         FLAT list of raw comment `data` dicts (walk the tree up to `depth`,
         skip 'more' stubs, drop comments below min_score). `post_id` may be a
         fullname (t3_abc) or bare id (abc)."""
+
+    def info(self, fullnames: list[str]) -> list[dict]:
+        """Current `data` of up to 100 posts/comments (/api/info). Never cached.
+        Reddit leaves out ids that no longer exist."""
 ```
+Transport (added in 0.2): with `transport="auto"` the first `.json` request that
+gets HTTP 403 (or a block page) switches the client to
+`prospector.reddit_rss.RssTransport` for the rest of its life. The RSS
+transport returns the same `data` dict shapes (with `score` and `num_comments`
+always 0, because feeds carry neither). `RedditError` now lives in
+`prospector/errors.py` and has `status` and `blocked` attributes;
+`prospector.reddit_client.RedditError` is the same class.
 Notes for A:
 - OAuth: client-credentials grant against `https://www.reddit.com/api/v1/access_token`
   with HTTP Basic (client_id, client_secret), `grant_type=client_credentials`.
@@ -281,6 +303,52 @@ point. Tests: feed a temp Store with crafted items; assert under-evidenced
 clusters are dropped and well-evidenced ones render with permalinks. analyze
 tests must run offline (monkeypatch the LLM call / available()->False path).
 
+## `prospector/reddit_rss.py` (added in 0.2)
+
+```python
+RSS_BASE = "https://www.reddit.com"        # old.reddit.com sends .rss to a login wall
+class RssTransport:
+    def __init__(self, user_agent: str, min_interval: float = 20.0,
+                 timeout: float = 30.0, http=None, log=None): ...
+    requests_made: int
+    def get_feed(self, path: str, params: dict | None = None) -> list[dict]
+    def listing(...) / search(...) / comments(...)   # same signatures as RedditClient
+    def info(self, fullnames) -> list[dict]          # /api/info.rss, max 100 ids
+def parse_feed(xml_bytes: bytes, path: str = "") -> list[dict]
+```
+Pacing: at least `min_interval` between requests, and when a response says
+`x-ratelimit-remaining` < 1 the next request waits for `x-ratelimit-reset` + 1 s.
+Measured on 2026-10-04 from a home IP: one request per clock minute.
+
+## `prospector/prune.py` (added in 0.2)
+
+```python
+prune(conn, max_age_days=7.0, now=None, client=None, skip_fresh_hours=12.0,
+      log=print) -> PruneResult
+delete_items(conn, ids) -> (items_deleted, vectors_deleted)  # items, matches, vectors
+purge_cache(cache_dir, max_age_hours=24.0, now=None) -> int
+is_gone(title, body, author) -> bool        # [deleted] / [removed] / deleted author
+```
+Deletes items with `created_utc` older than `max_age_days`, items that read as
+deleted or removed, and (with a `client`) items Reddit returns as deleted or
+leaves out of a non-empty `/api/info` answer. An empty answer deletes nothing.
+
+## `prospector/semantic.py` (added in 0.2, `[semantic]` extra)
+
+```python
+MODEL_NAME = "BAAI/bge-small-en-v1.5"; DIM = 384
+CONTRACT_KEYS = ("permalink", "subreddit", "title", "quote", "score", "created_utc")
+embed_pending(conn, embedder, batch_size=64, limit=None, now=None, log=...) -> EmbedStats
+search(conn, embedder, query, limit=10, subreddit=None, since=None, kind=None) -> list[dict]
+contract_view(hits) -> list[dict]           # exactly CONTRACT_KEYS per hit
+clusters(conn, k=None, subreddit=None, profile=None, since=None, examples=3) -> list[dict]
+default_embedder() -> Embedder              # lazy FastEmbedder (model loads on first use)
+```
+Tables: `item_vectors` (vec0: `item_id TEXT PRIMARY KEY`, `embedding float[384]`
+cosine, `subreddit`, `kind`, `created_utc`) and `item_embeddings` (model, text
+hash, time). A hit `score` is the cosine similarity (higher is closer), not the
+Reddit vote score.
+
 ## AGENT F — `prospector/cli.py`
 
 A `typer` app named `app`. Commands (all import the engine modules above):
@@ -293,7 +361,26 @@ prospector query   PROFILE [--min-pain 3] [--sub nursing] [--contains fax]
 prospector report  PROFILE [--analyze] [--out PATH] [--db ...]
 prospector export  PROFILE --format json|csv|md [--out PATH] [--db ...]
 prospector mcp                      # exec the MCP server (calls mcp_server.main())
+# added in 0.2
+prospector sweep   PROFILE ... [--transport auto|json|rss] [--combine-terms]
+prospector embed   [--db ...] [--batch-size 64] [--limit N]
+prospector semantic-search "QUERY" [--db ...] [--limit 10] [--sub X]
+                           [--since-days D] [--json]
+prospector clusters [--db ...] [--sub X] [--profile P] [--since-days D]
+                           [--k 0] [--examples 3] [--json]
+prospector prune   [--db ...] [--max-age-days 7] [--recheck/--no-recheck]
+                           [--skip-fresh-hours 12] [--transport auto]
+                           [--cache-dir PATH] [--cache-max-age-hours 24] [--json]
 ```
+CONTRACT (another tool codes against it, keep it exact):
+`prospector semantic-search "QUERY" --db PATH --limit N --json` prints one JSON
+array to stdout. Each element has exactly the keys `permalink`, `subreddit`,
+`title`, `quote`, `score`, `created_utc`. `score` is the cosine similarity
+(float, higher is closer). `title` is a string (a comment shows its thread
+title, or "" when that post is not stored). The command exits 0 and prints `[]`
+when the store is empty or the file does not exist (it never creates the file).
+Each command also prints a final `key=value` count line (`fetched=`,
+`embedded=`, `pruned=`, `searched=`) for scripts.
 Behavior: `sweep` builds RedditClient (OAuth auto if env creds present; `--oauth`
 forces requiring them), Store, loads profile, calls scrape.sweep, prints the
 SweepResult summary. `query` prints a compact table. `report` writes/echoes the
@@ -325,6 +412,11 @@ reddit_get_evidence(ids: list[str]) -> list[dict]         # EvidenceItem dicts
 reddit_stats(profile: str = "") -> dict
 reddit_export(format: str = "json", profile: str = "", min_pain: float = 0.0,
               limit: int = 500) -> str                     # serialized payload / path
+# added in 0.2 (need the [semantic] extra; no network)
+reddit_semantic_search(query: str, limit: int = 10, subreddit: str = "",
+                       since_days: float = 0.0) -> list[dict]  # hits with permalink + quote
+reddit_clusters(subreddit: str = "", profile: str = "", since_days: float = 0.0,
+                k: int = 0, examples: int = 3) -> list[dict]   # examples with permalink + quote
 ```
 Each tool wraps the engine functions; serialize dataclasses to plain dicts.
 `reddit_search`/`reddit_fetch_thread` hit Reddit live (and store results) so

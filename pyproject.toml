@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "prospector-reddit"
-version = "0.1.0"
+version = "0.2.0"
 description = "Plug-and-play engine that mines Reddit for unmet needs — with an MCP server so Claude becomes a Reddit research specialist."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -27,6 +27,8 @@ dependencies = [
 
 [project.optional-dependencies]
 analyze = ["openai>=1.30"]
+# Search by meaning: CPU embeddings (ONNX) in a sqlite-vec table.
+semantic = ["fastembed>=0.5", "sqlite-vec>=0.1.6,<0.2", "numpy>=1.26"]
 dev = ["pytest>=8.0"]
 
 [project.scripts]

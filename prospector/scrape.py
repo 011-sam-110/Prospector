@@ -35,7 +35,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, avoids hard import coupling
     from prospector.reddit_client import RedditClient
     from prospector.store import Store
 
-__all__ = ["sweep", "HIGH_NUM_COMMENTS", "TOP_PATTERNS_LIMIT"]
+__all__ = ["sweep", "combined_query", "HIGH_NUM_COMMENTS", "TOP_PATTERNS_LIMIT"]
 
 #: A post with at least this many comments is deep-fetched even if its lexicon
 #: pain score is below the profile threshold — a busy thread is itself a signal.
@@ -43,6 +43,21 @@ HIGH_NUM_COMMENTS: int = 50
 
 #: How many of the most-fired lexicon patterns to keep in the run summary.
 TOP_PATTERNS_LIMIT: int = 15
+
+
+def combined_query(terms: list[str]) -> str:
+    """Join search terms into one Reddit query: ``"a b" OR "c"``.
+
+    Reddit search accepts ``OR`` between quoted phrases. One combined query per
+    subreddit costs one request in place of one request per term, which matters
+    on the RSS transport (about one request per minute).
+    """
+    phrases = []
+    for term in terms:
+        clean = " ".join(str(term).replace('"', " ").split())
+        if clean:
+            phrases.append(f'"{clean}"')
+    return " OR ".join(phrases)
 
 
 def sweep(
@@ -55,6 +70,7 @@ def sweep(
     listing_limit: Optional[int] = None,
     max_threads: Optional[int] = None,
     log: Callable[[str], object] = print,
+    combine_terms: bool = False,
 ) -> SweepResult:
     """Run a full two-stage sweep for ``profile`` and return a :class:`SweepResult`.
 
@@ -74,6 +90,9 @@ def sweep(
         max_threads: Override the profile's stage-2 ``max_threads`` budget.
         log: Where human-readable progress / error lines go (defaults to
             :func:`print`); swap for a no-op or a logger in tests.
+        combine_terms: When ``True``, stage 1 sends ONE search per subreddit
+            with all search terms joined by ``OR`` (see :func:`combined_query`)
+            in place of one search per term.
 
     Returns:
         A :class:`SweepResult` with post/comment counts, per-subreddit tallies
@@ -136,7 +155,10 @@ def sweep(
         for data in raw_listing or []:
             _ingest_post(data, sub)
 
-        for term in profile.search_terms:
+        terms = list(profile.search_terms)
+        if combine_terms and len(terms) > 1:
+            terms = [combined_query(terms)]
+        for term in terms:
             try:
                 raw_search = client.search(
                     term,

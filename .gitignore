@@ -9,10 +9,14 @@ dist/
 venv/
 env/
 
-# prospector runtime
+# prospector runtime (the repo is public: no store, vectors or Reddit content)
 *.db
+*.db-wal
+*.db-shm
+*.db-journal
 *.sqlite
 *.sqlite3
+prospector-data/
 .cache/
 cache/
 reports/*.md

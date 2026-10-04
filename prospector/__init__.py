@@ -11,7 +11,7 @@ and the report renderer enforces an evidence-bound contract so every claimed
 "gap" is traceable to real Reddit permalinks and verbatim quotes.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 from prospector.models import (
     Item,

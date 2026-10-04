@@ -133,6 +133,7 @@ class RedditClient:
         )
         self._log = log or (lambda message: print(message, file=sys.stderr))
         self._rss: Optional[RssTransport] = None
+        self._json_counts = {"ok": 0, "http_403": 0, "http_429": 0, "other": 0}
         self._using_rss = transport == "rss"
 
         self.cache_dir = Path(cache_dir) if cache_dir is not None else default_cache_dir()
@@ -285,6 +286,10 @@ class RedditClient:
                 continue
 
             status = resp.status_code
+            outcome = {403: "http_403", 429: "http_429"}.get(status)
+            if outcome is None:
+                outcome = "ok" if status < 400 else "other"
+            self._json_counts[outcome] += 1
 
             # Stale token → drop it and retry once with a fresh grant.
             if status in (401, 403) and headers.get("Authorization"):
@@ -461,6 +466,15 @@ class RedditClient:
         """``True`` once the client reads the RSS feeds (forced or after a 403)."""
         return self._using_rss
 
+    def request_stats(self) -> dict:
+        """Requests sent so far by outcome (``.json`` and RSS added together):
+        ``ok``, ``http_403``, ``http_429`` and ``other``."""
+        total = dict(self._json_counts)
+        if self._rss is not None:
+            for key, value in self._rss.request_counts().items():
+                total[key] = total.get(key, 0) + value
+        return total
+
     @property
     def transport_in_use(self) -> str:
         """``"rss"`` or ``"json"``: the transport the next request will use."""
@@ -476,6 +490,7 @@ class RedditClient:
         except RedditError as exc:
             if self.transport == "auto" and (exc.status == 403 or exc.blocked):
                 self._using_rss = True
+                self.rss.note_external_failure()
                 self._log(
                     "[reddit] the .json endpoint was refused "
                     f"({exc.status or 'block page'}); using the RSS feeds for the rest "

@@ -333,3 +333,110 @@ def test_a_404_does_not_trigger_the_fallback(tmp_path):
 def test_default_user_agent_is_descriptive():
     assert "prospector" in DEFAULT_USER_AGENT
     assert "github.com/011-sam-110/Prospector" in DEFAULT_USER_AGENT
+
+
+# --------------------------------------------------------------------------- #
+# Pacing after failures, unavailable comment feeds, request counts
+# (2026-10-04 live run: from 18:52 every request got 429 then 403)
+# --------------------------------------------------------------------------- #
+def test_a_403_makes_the_next_request_wait_a_full_window():
+    rss, http, clock = _transport(
+        [FakeResp(status=403, content=b"blocked"), FakeResp(content=_feed("info.xml"))],
+        min_interval=20.0,
+    )
+    with pytest.raises(RedditError):
+        rss.listing("examplenursing")
+    rss.info(["t3_aaa111"])
+    # No rate headers on the 403: wait a full 60 s window, not the 20 s interval.
+    assert clock.sleeps == [60.0]
+    assert len(http.calls) == 2
+
+
+def test_consecutive_failures_double_the_wait():
+    rss, http, clock = _transport(
+        [
+            FakeResp(status=429),
+            FakeResp(status=429),
+            FakeResp(status=429),
+            FakeResp(content=_feed("info.xml")),
+        ],
+        min_interval=0.0,
+    )
+    assert len(rss.info(["t3_aaa111"])) == 2
+    assert clock.sleeps == [60.0, 120.0, 240.0]
+
+
+def test_failure_wait_uses_the_reset_header_and_is_capped_at_10_minutes():
+    rss, _http, _clock = _transport([], min_interval=0.0)
+    waits = []
+    for _ in range(6):
+        before = rss._monotonic()
+        rss._record_failure(FakeResp(status=429, headers={"x-ratelimit-reset": "52"}))
+        waits.append(rss._not_before - before)
+    assert waits == [53.0, 106.0, 212.0, 424.0, 600.0, 600.0]
+
+
+def test_a_success_resets_the_failure_count():
+    rss, _http, clock = _transport(
+        [
+            FakeResp(status=429),
+            FakeResp(content=_feed("info.xml")),
+            FakeResp(status=429),
+            FakeResp(content=_feed("info.xml")),
+        ],
+        min_interval=0.0,
+    )
+    rss.info(["t3_aaa111"])
+    rss.info(["t3_aaa111"])
+    assert clock.sleeps == [60.0, 60.0]
+
+
+def test_a_403_on_a_comment_feed_means_unavailable_and_is_not_retried():
+    from prospector.errors import CommentsUnavailable
+
+    rss, http, _clock = _transport([FakeResp(status=403, content=b"blocked")])
+    with pytest.raises(CommentsUnavailable):
+        rss.comments("t3_aaa111", limit=40)
+    assert len(http.calls) == 1
+
+
+def test_requests_are_counted_by_outcome():
+    rss, _http, _clock = _transport(
+        [
+            FakeResp(status=429),
+            FakeResp(content=_feed("info.xml")),
+            FakeResp(status=403, content=b"blocked"),
+        ],
+        min_interval=0.0,
+    )
+    rss.info(["t3_aaa111"])
+    with pytest.raises(RedditError):
+        rss.listing("examplenursing")
+    assert rss.request_counts() == {"ok": 1, "http_403": 1, "http_429": 1, "other": 0}
+
+
+def test_the_transport_stops_after_six_refusals_in_a_row():
+    rss, http, _clock = _transport(
+        [FakeResp(status=403, content=b"blocked") for _ in range(6)], min_interval=0.0
+    )
+    for _ in range(6):
+        with pytest.raises(RedditError):
+            rss.listing("examplenursing")
+    with pytest.raises(RedditError) as info:
+        rss.listing("examplenursing")
+    assert info.value.blocked is True
+    assert len(http.calls) == 6  # the seventh call sent nothing
+
+
+def test_the_switch_to_rss_waits_a_full_window_after_the_json_403(tmp_path):
+    client, _json_http, rss_http, _notices = _client(
+        tmp_path,
+        [FakeResp(status=403, text="<html>blocked</html>")],
+        [FakeResp(content=_feed("listing_new.xml"))],
+    )
+    clock = FakeClock()
+    client.rss._monotonic = clock.monotonic
+    client.rss._sleep = clock.sleep
+    client.listing("examplenursing")
+    assert clock.sleeps == [60.0]
+    assert client.request_stats() == {"ok": 1, "http_403": 1, "http_429": 0, "other": 0}

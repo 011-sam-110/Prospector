@@ -63,12 +63,15 @@ General rules for all agents:
     time_window="year"; listing_limit=100; max_threads=60
     pain_lexicon: list[LexiconRule]; pain_threshold=3.0
     evidence: EvidenceThresholds; comments: CommentConfig
+    rss_comment_threads=10        # added in 0.2: RSS stage-2 thread floor
 @dataclass EvidenceItem:
     id; permalink; quote; subreddit; author; score; created_utc
 @dataclass SweepResult:
     run_id; profile; posts_collected; comments_collected; threads_deep_fetched
     subreddits: dict[str,int]; top_patterns: list[tuple[str,int]]
     started_at; finished_at; .as_dict() -> dict
+    requests: dict[str,int]   # added in 0.2: this sweep's requests by outcome,
+                              # saved in the sweeps.stats JSON
 ```
 
 ## `prospector/profiles.py`  (DONE — reference only)
@@ -107,6 +110,7 @@ class RedditClient:
     def using_rss(self) -> bool: ...        # True once the client reads the RSS feeds
     @property
     def transport_in_use(self) -> str: ...  # "json" | "rss"
+    def request_stats(self) -> dict: ...    # {ok, http_403, http_429, other}, .json + RSS
 
     def get_json(self, path: str, params: dict | None = None) -> dict:
         """Core fetch. `path` is e.g. '/r/nursing/.json' or '/r/x/comments/abc.json'.
@@ -223,7 +227,10 @@ def sweep(profile: Profile, client: RedditClient, store: Store,
           run_id: str | None = None, now: int | None = None,
           time_window: str | None = None, listing_limit: int | None = None,
           max_threads: int | None = None,
-          log=print) -> SweepResult:
+          log=print,
+          combine_terms: bool = False,              # added in 0.2
+          rss_comment_threads: int | None = None,   # added in 0.2
+          ) -> SweepResult:
     """
     Stage 1 (broad/cheap): for each sub in profile.subreddits, pull listing()
       (limit=listing_limit or profile.listing_limit) AND search() for each
@@ -234,6 +241,11 @@ def sweep(profile: Profile, client: RedditClient, store: Store,
       OR high num_comments; take up to (max_threads or profile.max_threads),
       ordered by pain_score desc. For each, client.comments(...) bounded by
       profile.comments. Score comments, upsert.
+    RSS transport (client.using_rss, added in 0.2): feeds carry no comment
+      counts, so stage 2 reads at least (rss_comment_threads or
+      profile.rss_comment_threads) threads: the threshold candidates first, then
+      the next posts by pain_score desc, created_utc desc. The .json path is
+      unchanged.
     Record + return a SweepResult (counts, per-sub tallies, top matched patterns).
     `run_id` defaults to uuid4().hex; `now` to int(time.time()). Be resilient:
     one sub failing must not abort the sweep (catch, log, continue).
@@ -319,6 +331,12 @@ def parse_feed(xml_bytes: bytes, path: str = "") -> list[dict]
 Pacing: at least `min_interval` between requests, and when a response says
 `x-ratelimit-remaining` < 1 the next request waits for `x-ratelimit-reset` + 1 s.
 Measured on 2026-10-04 from a home IP: one request per clock minute.
+After a failure (429, 403, 5xx, empty body, block page, network error) the next
+request waits a full window (`x-ratelimit-reset` + 1 s, else 60 s), doubled for
+each failure in a row up to 600 s. After 6 failures in a row the transport sends
+nothing more and raises `RedditError(blocked=True)`. A 403 on a comment feed
+raises `CommentsUnavailable` (a `RedditError`) and is not retried; the sweep skips
+that thread. `request_counts()` returns `{ok, http_403, http_429, other}`.
 
 ## `prospector/prune.py` (added in 0.2)
 
@@ -363,6 +381,7 @@ prospector export  PROFILE --format json|csv|md [--out PATH] [--db ...]
 prospector mcp                      # exec the MCP server (calls mcp_server.main())
 # added in 0.2
 prospector sweep   PROFILE ... [--transport auto|json|rss] [--combine-terms]
+                           [--rss-comment-threads N]
 prospector embed   [--db ...] [--batch-size 64] [--limit N]
 prospector semantic-search "QUERY" [--db ...] [--limit 10] [--sub X]
                            [--since-days D] [--json]

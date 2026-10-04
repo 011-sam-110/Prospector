@@ -28,6 +28,7 @@ import uuid
 from collections import Counter
 from typing import TYPE_CHECKING, Callable, Optional
 
+from prospector.errors import CommentsUnavailable
 from prospector.models import Item, Profile, SweepResult
 from prospector.scorer import compile_lexicon, score_item
 
@@ -71,6 +72,7 @@ def sweep(
     max_threads: Optional[int] = None,
     log: Callable[[str], object] = print,
     combine_terms: bool = False,
+    rss_comment_threads: Optional[int] = None,
 ) -> SweepResult:
     """Run a full two-stage sweep for ``profile`` and return a :class:`SweepResult`.
 
@@ -93,6 +95,12 @@ def sweep(
         combine_terms: When ``True``, stage 1 sends ONE search per subreddit
             with all search terms joined by ``OR`` (see :func:`combined_query`)
             in place of one search per term.
+        rss_comment_threads: Override the profile's ``rss_comment_threads``.
+            On the RSS transport the feeds carry no comment counts, so the
+            "busy thread" rule cannot fire and few posts clear the pain
+            threshold. Stage 2 then reads at least this many threads: the
+            threshold candidates first, then the next posts by pain score,
+            newest first on a tie. The ``.json`` path ignores this setting.
 
     Returns:
         A :class:`SweepResult` with post/comment counts, per-subreddit tallies
@@ -110,6 +118,9 @@ def sweep(
     thread_budget = max_threads if max_threads else profile.max_threads
 
     compiled = compile_lexicon(profile.pain_lexicon)
+
+    stats_fn = getattr(client, "request_stats", None)
+    stats_before = stats_fn() if callable(stats_fn) else None
 
     # ----------------------------------------------------------------- #
     # Shared accumulators                                               #
@@ -193,6 +204,28 @@ def sweep(
     candidates.sort(key=lambda it: (it.pain_score, it.num_comments), reverse=True)
     candidates = candidates[: thread_budget if thread_budget and thread_budget > 0 else 0]
 
+    if getattr(client, "using_rss", False):
+        # RSS has no comment counts: rank by pain, then by recency, and make
+        # sure at least ``floor`` threads are read.
+        floor = (
+            rss_comment_threads
+            if rss_comment_threads is not None
+            else profile.rss_comment_threads
+        )
+        chosen = {it.id for it in candidates}
+        ranked = sorted(
+            posts.values(),
+            key=lambda it: (it.pain_score, it.created_utc),
+            reverse=True,
+        )
+        candidates.sort(key=lambda it: (it.pain_score, it.created_utc), reverse=True)
+        for it in ranked:
+            if len(candidates) >= max(0, int(floor)):
+                break
+            if it.id not in chosen:
+                candidates.append(it)
+                chosen.add(it.id)
+
     threads_deep_fetched = 0
     cc = profile.comments
     for post in candidates:
@@ -203,6 +236,9 @@ def sweep(
                 depth=cc.depth,
                 min_score=cc.min_score,
             )
+        except CommentsUnavailable:
+            log(f"[sweep] comments not available for {post.id} (HTTP 403); skipped")
+            continue
         except Exception as exc:  # noqa: BLE001 - skip this thread, keep going
             log(f"[sweep] comments for {post.id} failed: {exc!r}")
             continue
@@ -244,6 +280,12 @@ def sweep(
         started_at=started_at,
         finished_at=int(time.time()),
     )
+    if stats_before is not None:
+        stats_after = stats_fn()
+        result.requests = {
+            key: int(stats_after.get(key, 0)) - int(stats_before.get(key, 0))
+            for key in stats_after
+        }
     log(
         f"[sweep] {profile.name}: {result.posts_collected} posts, "
         f"{result.comments_collected} comments from "

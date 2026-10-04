@@ -135,6 +135,9 @@ class Profile:
     pain_threshold: float = 3.0
     evidence: EvidenceThresholds = field(default_factory=EvidenceThresholds)
     comments: CommentConfig = field(default_factory=CommentConfig)
+    #: On the RSS transport (no comment counts), stage 2 reads the comments of
+    #: at least this many posts, ranked by pain score, then by recency.
+    rss_comment_threads: int = 10
 
 
 # --------------------------------------------------------------------------- #
@@ -166,6 +169,9 @@ class SweepResult:
     top_patterns: list[tuple[str, int]] = field(default_factory=list)
     started_at: int = 0
     finished_at: int = 0
+    #: Requests sent by this sweep, by outcome (ok, http_403, http_429, other).
+    #: Empty when the client does not count requests.
+    requests: dict[str, int] = field(default_factory=dict)
 
     def as_dict(self) -> dict:
         return {
@@ -178,4 +184,5 @@ class SweepResult:
             "top_patterns": self.top_patterns,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
+            "requests": dict(self.requests),
         }

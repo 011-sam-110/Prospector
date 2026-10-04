@@ -350,3 +350,144 @@ def test_combine_terms_sends_one_search_per_subreddit():
     plain = FakeClient()
     scrape.sweep(prof, plain, FakeStore(), log=lambda _m: None)
     assert len(plain.search_calls) == 6  # default: one search per term per sub
+
+
+# --------------------------------------------------------------------------- #
+# RSS transport: read the top N threads even when no post is "painful"         #
+# --------------------------------------------------------------------------- #
+class FakeRssClient(FakeClient):
+    """A client that reports the RSS transport (no comment counts, no scores)."""
+
+    using_rss = True
+
+
+def _quiet_profile(**overrides):
+    base = dict(
+        name="quiet",
+        description="",
+        subreddits=["nursing"],
+        search_terms=[],
+        pain_lexicon=[LexiconRule(pattern=r"\bfax\b", weight=1.0)],
+        pain_threshold=3.0,
+        max_threads=60,
+        rss_comment_threads=2,
+    )
+    base.update(overrides)
+    return Profile(**base)
+
+
+def _dated_post(pid, title, created, body=""):
+    data = _post(pid, "nursing", title, body=body)
+    data["created_utc"] = created
+    return data
+
+
+def test_rss_run_reads_top_n_threads_when_no_post_reaches_the_threshold():
+    listing = [
+        _dated_post("old", "old quiet post", 1_700_000_000),
+        _dated_post("fax1", "one fax mention", 1_700_000_100),  # pain 1.0, below 3.0
+        _dated_post("new", "newest quiet post", 1_700_000_300),
+        _dated_post("mid", "middle quiet post", 1_700_000_200),
+    ]
+    comments = {
+        "t3_fax1": [_comment("c1", "nursing", "we fax too", "t3_fax1")],
+        "t3_new": [_comment("c2", "nursing", "same here", "t3_new")],
+        "t3_mid": [_comment("c3", "nursing", "not read", "t3_mid")],
+    }
+    client = FakeRssClient(listings={"nursing": listing}, comments=comments)
+    store = FakeStore()
+    result = scrape.sweep(_quiet_profile(), client, store, log=lambda _m: None)
+
+    # Highest pain first, then the newest post breaks the tie among pain 0.
+    assert client.comment_calls == ["t3_fax1", "t3_new"]
+    assert result.threads_deep_fetched == 2
+    assert result.comments_collected == 2
+    assert {"t1_c1", "t1_c2"} <= set(store.items)
+
+
+def test_rss_comment_thread_count_can_be_overridden():
+    listing = [_dated_post(f"p{i}", "quiet", 1_700_000_000 + i) for i in range(5)]
+    client = FakeRssClient(listings={"nursing": listing})
+    scrape.sweep(
+        _quiet_profile(), client, FakeStore(), log=lambda _m: None, rss_comment_threads=4
+    )
+    assert client.comment_calls == ["t3_p4", "t3_p3", "t3_p2", "t3_p1"]
+
+
+def test_json_run_keeps_the_threshold_rule():
+    listing = [_dated_post(f"p{i}", "quiet", 1_700_000_000 + i) for i in range(5)]
+    client = FakeClient(listings={"nursing": listing})  # .json path: using_rss absent
+    result = scrape.sweep(_quiet_profile(), client, FakeStore(), log=lambda _m: None)
+    assert client.comment_calls == []
+    assert result.threads_deep_fetched == 0
+
+
+def test_profile_yaml_sets_rss_comment_threads(tmp_path):
+    from prospector.profiles import load_profile
+
+    path = tmp_path / "p.yaml"
+    path.write_text("name: p\nsubreddits: [a]\nrss_comment_threads: 4\n", encoding="utf-8")
+    assert load_profile(str(path)).rss_comment_threads == 4
+    path.write_text("name: p\nsubreddits: [a]\n", encoding="utf-8")
+    assert load_profile(str(path)).rss_comment_threads == 10
+
+
+# --------------------------------------------------------------------------- #
+# Request counts per sweep, and comment feeds that are not available           #
+# --------------------------------------------------------------------------- #
+class CountingRssClient(FakeRssClient):
+    """RSS fake with request counters and a thread whose feed returns 403."""
+
+    def __init__(self, *a, unavailable=(), **k):
+        super().__init__(*a, **k)
+        self.unavailable = set(unavailable)
+        self.counts = {"ok": 0, "http_403": 0, "http_429": 0, "other": 0}
+
+    def request_stats(self):
+        return dict(self.counts)
+
+    def listing(self, *a, **k):
+        self.counts["ok"] += 1
+        self.counts["http_429"] += 1  # one 429 before the success
+        return super().listing(*a, **k)
+
+    def comments(self, post_id, limit=100, depth=2, min_score=0):
+        from prospector.errors import CommentsUnavailable
+
+        if post_id in self.unavailable:
+            self.comment_calls.append(post_id)
+            self.counts["http_403"] += 1
+            raise CommentsUnavailable(f"no comments feed for {post_id}", status=403)
+        self.counts["ok"] += 1
+        return super().comments(post_id, limit, depth, min_score)
+
+
+def test_sweep_records_request_counts_and_skips_unavailable_threads():
+    listing = [_dated_post(f"p{i}", "quiet", 1_700_000_000 + i) for i in range(3)]
+    client = CountingRssClient(
+        listings={"nursing": listing},
+        comments={"t3_p1": [_comment("c1", "nursing", "a reply", "t3_p1")]},
+        unavailable={"t3_p2"},
+    )
+    client.counts["ok"] = 5  # requests made before this sweep must not count
+    store = FakeStore()
+    result = scrape.sweep(_quiet_profile(), client, store, log=lambda _m: None)
+
+    assert client.comment_calls == ["t3_p2", "t3_p1"]
+    assert result.threads_deep_fetched == 1  # the 403 thread is not counted
+    assert result.requests == {"ok": 2, "http_403": 1, "http_429": 1, "other": 0}
+    assert store.sweeps[-1].as_dict()["requests"] == result.requests
+
+
+def test_request_counts_are_saved_in_the_store_sweeps_table(tmp_path):
+    import json
+
+    from prospector.store import Store
+
+    listing = [_dated_post("p0", "quiet", 1_700_000_000)]
+    client = CountingRssClient(listings={"nursing": listing})
+    store = Store(tmp_path / "s.db")
+    result = scrape.sweep(_quiet_profile(rss_comment_threads=0), client, store, log=lambda _m: None)
+    row = store.conn.execute("SELECT stats FROM sweeps WHERE run_id = ?", (result.run_id,)).fetchone()
+    assert json.loads(row[0])["requests"] == {"ok": 1, "http_403": 0, "http_429": 1, "other": 0}
+    store.close()

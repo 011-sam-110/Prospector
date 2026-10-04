@@ -3,7 +3,13 @@
 #
 # The user unit prospector-sweep.service runs this script once a day.
 # Each step prints a count line. The last line is a total:
-#   daily: fetched=N embedded=N pruned=N searched=N failures=N
+#   daily: fetched=N embedded=N pruned=N searched=N profiles_ok=N profiles_failed=N failures=N
+#
+# A profile counts as failed when its sweep exits non-zero, fetches nothing,
+# or gets more refused requests (403 + 429) than good ones.
+# The script exits non-zero when every profile failed, or when the embed,
+# prune or search-check step failed. One failed profile alone is reported in
+# the daily line but does not fail the unit.
 #
 # The prune step always runs, also when a sweep or the embed step fails,
 # because content deleted on Reddit must leave the store at every run.
@@ -34,6 +40,9 @@ LOG="$(mktemp)"
 trap 'rm -f "$LOG"' EXIT
 
 failures=0
+step_failures=0
+profiles_ok=0
+profiles_failed=0
 fetched=0
 embedded=0
 pruned=0
@@ -48,43 +57,61 @@ echo "prospector daily: db=$DB profiles=[$PROFILES] transport=$TRANSPORT"
 
 for profile in $PROFILES; do
   echo "== sweep $profile"
+  : > "$LOG"
   "$BIN" sweep "$profile" --db "$DB" --time week --combine-terms \
     --max-threads "$MAX_THREADS" --transport "$TRANSPORT" 2>&1 | tee "$LOG"
-  if [ "${PIPESTATUS[0]}" -ne 0 ]; then
-    echo "sweep $profile FAILED"
-    failures=$((failures + 1))
+  rc="${PIPESTATUS[0]}"
+  n="$(value_of fetched)"; n="${n:-0}"
+  ok="$(value_of requests_ok)"; ok="${ok:-0}"
+  r403="$(value_of requests_403)"; r429="$(value_of requests_429)"
+  refused=$(( ${r403:-0} + ${r429:-0} ))
+  fetched=$((fetched + n))
+  reason=""
+  if [ "$rc" -ne 0 ]; then
+    reason="exit code $rc"
+  elif [ "$n" -eq 0 ]; then
+    reason="fetched nothing"
+  elif [ "$refused" -gt "$ok" ]; then
+    reason="most requests refused ($refused refused, $ok ok)"
+  fi
+  if [ -n "$reason" ]; then
+    echo "sweep $profile FAILED: $reason"
+    profiles_failed=$((profiles_failed + 1))
   else
-    n="$(value_of fetched)"
-    fetched=$((fetched + ${n:-0}))
+    profiles_ok=$((profiles_ok + 1))
   fi
 done
 
 echo "== embed"
+: > "$LOG"
 "$BIN" embed --db "$DB" 2>&1 | tee "$LOG"
 if [ "${PIPESTATUS[0]}" -ne 0 ]; then
   echo "embed FAILED"
-  failures=$((failures + 1))
+  step_failures=$((step_failures + 1))
 else
   embedded=$(value_of embedded)
 fi
 
 echo "== prune"
+: > "$LOG"
 "$BIN" prune --db "$DB" --max-age-days "$MAX_AGE_DAYS" --transport "$TRANSPORT" 2>&1 | tee "$LOG"
 if [ "${PIPESTATUS[0]}" -ne 0 ]; then
   echo "prune FAILED"
-  failures=$((failures + 1))
+  step_failures=$((step_failures + 1))
 else
   pruned=$(value_of pruned)
 fi
 
 echo "== search check"
+: > "$LOG"
 "$BIN" semantic-search "$CHECK_QUERY" --db "$DB" --limit 3 2>&1 | tee "$LOG"
 if [ "${PIPESTATUS[0]}" -ne 0 ]; then
   echo "search check FAILED"
-  failures=$((failures + 1))
+  step_failures=$((step_failures + 1))
 else
   searched=$(value_of searched)
 fi
 
-echo "daily: fetched=${fetched:-0} embedded=${embedded:-0} pruned=${pruned:-0} searched=${searched:-0} failures=$failures"
-[ "$failures" -eq 0 ]
+failures=$((profiles_failed + step_failures))
+echo "daily: fetched=${fetched:-0} embedded=${embedded:-0} pruned=${pruned:-0} searched=${searched:-0} profiles_ok=$profiles_ok profiles_failed=$profiles_failed failures=$failures"
+[ "$profiles_ok" -gt 0 ] && [ "$step_failures" -eq 0 ]

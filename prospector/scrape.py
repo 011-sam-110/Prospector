@@ -28,6 +28,7 @@ import uuid
 from collections import Counter
 from typing import TYPE_CHECKING, Callable, Optional
 
+from prospector.errors import CommentsUnavailable
 from prospector.models import Item, Profile, SweepResult
 from prospector.scorer import compile_lexicon, score_item
 
@@ -117,6 +118,9 @@ def sweep(
     thread_budget = max_threads if max_threads else profile.max_threads
 
     compiled = compile_lexicon(profile.pain_lexicon)
+
+    stats_fn = getattr(client, "request_stats", None)
+    stats_before = stats_fn() if callable(stats_fn) else None
 
     # ----------------------------------------------------------------- #
     # Shared accumulators                                               #
@@ -232,6 +236,9 @@ def sweep(
                 depth=cc.depth,
                 min_score=cc.min_score,
             )
+        except CommentsUnavailable:
+            log(f"[sweep] comments not available for {post.id} (HTTP 403); skipped")
+            continue
         except Exception as exc:  # noqa: BLE001 - skip this thread, keep going
             log(f"[sweep] comments for {post.id} failed: {exc!r}")
             continue
@@ -273,6 +280,12 @@ def sweep(
         started_at=started_at,
         finished_at=int(time.time()),
     )
+    if stats_before is not None:
+        stats_after = stats_fn()
+        result.requests = {
+            key: int(stats_after.get(key, 0)) - int(stats_before.get(key, 0))
+            for key in stats_after
+        }
     log(
         f"[sweep] {profile.name}: {result.posts_collected} posts, "
         f"{result.comments_collected} comments from "

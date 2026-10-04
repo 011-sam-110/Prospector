@@ -25,3 +25,8 @@ class RedditError(Exception):
         super().__init__(message)
         self.status = status
         self.blocked = blocked
+
+
+class CommentsUnavailable(RedditError):
+    """A thread's comment feed was refused (HTTP 403). The sweep skips the
+    thread and does not retry it."""

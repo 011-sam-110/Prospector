@@ -70,6 +70,8 @@ General rules for all agents:
     run_id; profile; posts_collected; comments_collected; threads_deep_fetched
     subreddits: dict[str,int]; top_patterns: list[tuple[str,int]]
     started_at; finished_at; .as_dict() -> dict
+    requests: dict[str,int]   # added in 0.2: this sweep's requests by outcome,
+                              # saved in the sweeps.stats JSON
 ```
 
 ## `prospector/profiles.py`  (DONE — reference only)
@@ -108,6 +110,7 @@ class RedditClient:
     def using_rss(self) -> bool: ...        # True once the client reads the RSS feeds
     @property
     def transport_in_use(self) -> str: ...  # "json" | "rss"
+    def request_stats(self) -> dict: ...    # {ok, http_403, http_429, other}, .json + RSS
 
     def get_json(self, path: str, params: dict | None = None) -> dict:
         """Core fetch. `path` is e.g. '/r/nursing/.json' or '/r/x/comments/abc.json'.
@@ -328,6 +331,12 @@ def parse_feed(xml_bytes: bytes, path: str = "") -> list[dict]
 Pacing: at least `min_interval` between requests, and when a response says
 `x-ratelimit-remaining` < 1 the next request waits for `x-ratelimit-reset` + 1 s.
 Measured on 2026-10-04 from a home IP: one request per clock minute.
+After a failure (429, 403, 5xx, empty body, block page, network error) the next
+request waits a full window (`x-ratelimit-reset` + 1 s, else 60 s), doubled for
+each failure in a row up to 600 s. After 6 failures in a row the transport sends
+nothing more and raises `RedditError(blocked=True)`. A 403 on a comment feed
+raises `CommentsUnavailable` (a `RedditError`) and is not retried; the sweep skips
+that thread. `request_counts()` returns `{ok, http_403, http_429, other}`.
 
 ## `prospector/prune.py` (added in 0.2)
 

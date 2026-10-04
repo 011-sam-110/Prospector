@@ -11,6 +11,14 @@ these changes, each measured from a home IP on 2026-10-04:
   measured budget was one request per clock minute. The transport waits for the
   reset when ``remaining`` is below 1, so the real spacing can be longer than
   ``min_interval``.
+* After any failed request (429, 403, 5xx, an empty body, a block page or a
+  network error) the next request waits for the full window: the reset from
+  the headers plus 1 s, or 60 s when there is no header. Each further failure
+  in a row doubles that wait, up to 10 minutes. After 6 failures in a row the
+  transport sends nothing more and raises at once. In the 2026-10-04 run,
+  after about 47 good requests, every request got 429 and then 403. The cause
+  is not proven. A request sent 20 s after a failure, inside the same window,
+  possibly kept the block going.
 * ``/api/info.rss?id=...`` returns up to 100 posts or comments in one request
   and leaves out ids that no longer exist. :meth:`RssTransport.info` uses it to
   find content that was deleted on Reddit.
@@ -33,7 +41,7 @@ from typing import Callable, Iterable, Optional
 
 import httpx
 
-from prospector.errors import RedditError
+from prospector.errors import CommentsUnavailable, RedditError
 
 __all__ = [
     "RSS_BASE",
@@ -266,8 +274,14 @@ class RssTransport:
 
     #: Number of extra attempts after the first one on a transient failure.
     _MAX_RETRIES = 3
-    #: Ceiling for one wait (rate-limit reset or backoff), in seconds.
+    #: Ceiling for one reset value read from the headers, in seconds.
     _MAX_WAIT = 120.0
+    #: Wait after a failure when the response has no reset header.
+    _FULL_WINDOW = 60.0
+    #: Ceiling for the doubled wait after failures in a row.
+    _MAX_FAILURE_WAIT = 600.0
+    #: After this many failures in a row, stop sending requests.
+    _MAX_FAILURES_IN_A_ROW = 6
 
     def __init__(
         self,
@@ -287,7 +301,22 @@ class RssTransport:
         self._sleep = time.sleep
         self._last_request: Optional[float] = None
         self._not_before: Optional[float] = None
+        self._failures_in_a_row = 0
         self.requests_made = 0
+        self._counts = {"ok": 0, "http_403": 0, "http_429": 0, "other": 0}
+
+    def request_counts(self) -> dict:
+        """Requests sent so far, by outcome: ``ok``, ``http_403``, ``http_429``
+        and ``other`` (5xx, other 4xx, empty body, block page, network error)."""
+        return dict(self._counts)
+
+    def _count(self, outcome: str) -> None:
+        self._counts[outcome if outcome in self._counts else "other"] += 1
+
+    @property
+    def stopped(self) -> bool:
+        """``True`` after too many failures in a row: no more requests are sent."""
+        return self._failures_in_a_row >= self._MAX_FAILURES_IN_A_ROW
 
     # ------------------------------------------------------------------ #
     # Pacing
@@ -305,13 +334,34 @@ class RssTransport:
         self._last_request = self._monotonic()
 
     def _note_rate_headers(self, resp: "httpx.Response") -> None:
-        """Remember when the rate window resets if this response used it up."""
+        """After a success: remember when the window resets if it is used up."""
+        self._failures_in_a_row = 0
         remaining = _header_float(resp, "x-ratelimit-remaining")
         reset = _header_float(resp, "x-ratelimit-reset")
         if remaining is not None and reset is not None and remaining < 1:
             self._not_before = self._monotonic() + min(max(reset, 0.0), self._MAX_WAIT) + 1.0
         else:
             self._not_before = None
+
+    def _record_failure(self, resp: Optional["httpx.Response"] = None) -> None:
+        """After a failure: hold the next request for a full window, doubled for
+        each failure in a row and capped at 10 minutes."""
+        self._failures_in_a_row += 1
+        reset = _header_float(resp, "x-ratelimit-reset") if resp is not None else None
+        if reset is not None:
+            base = min(max(reset, 0.0), self._MAX_WAIT) + 1.0
+        else:
+            base = self._FULL_WINDOW
+        wait = min(base * 2 ** (self._failures_in_a_row - 1), self._MAX_FAILURE_WAIT)
+        self._not_before = self._monotonic() + wait
+
+    def note_external_failure(self) -> None:
+        """Another transport just got refused (the ``.json`` 403 that triggers
+        the switch to RSS). That request can use up the window too, so wait a
+        full window before the first feed request."""
+        self._record_failure(None)
+        # The switch itself is not a feed failure: do not start the doubling.
+        self._failures_in_a_row = 0
 
     # ------------------------------------------------------------------ #
     # Core fetch
@@ -320,32 +370,39 @@ class RssTransport:
         """Fetch ``RSS_BASE + path`` and return its entries as ``data`` dicts.
 
         Retries ``429``, ``5xx``, network errors and empty ``200`` bodies (a soft
-        rate limit) up to three times. Raises :class:`RedditError` on any other
-        ``4xx`` (``status`` set) or on a body that is not an Atom feed.
+        rate limit) up to three times, each after the failure wait. Raises
+        :class:`RedditError` on any other ``4xx`` (``status`` set) or on a body
+        that is not an Atom feed. A ``403`` on a comment feed raises
+        :class:`~prospector.errors.CommentsUnavailable` and is not retried.
         """
         if not path.startswith("/"):
             path = "/" + path
         url = RSS_BASE + path
         headers = {"User-Agent": self.user_agent, "Accept": "application/atom+xml"}
-        backoff = 30.0
         last_problem = "no attempt made"
 
         for attempt in range(self._MAX_RETRIES + 1):
+            if self.stopped:
+                raise RedditError(
+                    f"Reddit RSS paused: {self._failures_in_a_row} failed requests in a "
+                    f"row; {path} was not requested",
+                    blocked=True,
+                )
             self._wait_turn()
             try:
                 resp = self._http.get(url, params=params, headers=headers)
             except httpx.HTTPError as exc:
                 self.requests_made += 1
+                self._count("other")
+                self._record_failure(None)
                 last_problem = f"network error: {exc}"
-                if attempt < self._MAX_RETRIES:
-                    self._sleep(min(backoff, self._MAX_WAIT))
-                    backoff *= 2
                 continue
             self.requests_made += 1
-            self._note_rate_headers(resp)
             status = int(resp.status_code)
 
             if status == 429 or status >= 500:
+                self._count("http_429" if status == 429 else "other")
+                self._record_failure(resp)
                 last_problem = f"HTTP {status}"
                 if attempt >= self._MAX_RETRIES:
                     raise RedditError(
@@ -353,26 +410,44 @@ class RssTransport:
                         f"after {attempt + 1} attempts",
                         status=status,
                     )
-                if self._not_before is None:
-                    # No reset header: fall back to an exponential backoff.
-                    self._sleep(min(backoff, self._MAX_WAIT))
-                    backoff *= 2
                 self._log(f"[rss] HTTP {status} for {path}; waiting, then retrying")
                 continue
 
+            if status == 403:
+                self._count("http_403")
+                self._record_failure(resp)
+                if "/comments/" in path:
+                    raise CommentsUnavailable(
+                        f"Reddit RSS returned HTTP 403 for {path}: comments not available",
+                        status=status,
+                    )
+                raise RedditError(
+                    f"Reddit RSS returned HTTP {status} for {path}", status=status
+                )
+
             if status >= 400:
+                # 404 and the like: about this path, not about the rate limit.
+                self._count("other")
+                self._note_rate_headers(resp)
                 raise RedditError(
                     f"Reddit RSS returned HTTP {status} for {path}", status=status
                 )
 
             body = resp.content or b""
             if not body.strip():
+                self._count("other")
+                self._record_failure(resp)
                 last_problem = "empty body"
-                if attempt < self._MAX_RETRIES:
-                    self._sleep(min(backoff, self._MAX_WAIT))
-                    backoff *= 2
                 continue
-            return parse_feed(body, path)
+            try:
+                entries = parse_feed(body, path)
+            except RedditError:
+                self._count("other")
+                self._record_failure(resp)
+                raise
+            self._count("ok")
+            self._note_rate_headers(resp)
+            return entries
 
         raise RedditError(
             f"Reddit RSS request for {path} failed after "

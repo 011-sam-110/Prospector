@@ -430,3 +430,64 @@ def test_profile_yaml_sets_rss_comment_threads(tmp_path):
     assert load_profile(str(path)).rss_comment_threads == 4
     path.write_text("name: p\nsubreddits: [a]\n", encoding="utf-8")
     assert load_profile(str(path)).rss_comment_threads == 10
+
+
+# --------------------------------------------------------------------------- #
+# Request counts per sweep, and comment feeds that are not available           #
+# --------------------------------------------------------------------------- #
+class CountingRssClient(FakeRssClient):
+    """RSS fake with request counters and a thread whose feed returns 403."""
+
+    def __init__(self, *a, unavailable=(), **k):
+        super().__init__(*a, **k)
+        self.unavailable = set(unavailable)
+        self.counts = {"ok": 0, "http_403": 0, "http_429": 0, "other": 0}
+
+    def request_stats(self):
+        return dict(self.counts)
+
+    def listing(self, *a, **k):
+        self.counts["ok"] += 1
+        self.counts["http_429"] += 1  # one 429 before the success
+        return super().listing(*a, **k)
+
+    def comments(self, post_id, limit=100, depth=2, min_score=0):
+        from prospector.errors import CommentsUnavailable
+
+        if post_id in self.unavailable:
+            self.comment_calls.append(post_id)
+            self.counts["http_403"] += 1
+            raise CommentsUnavailable(f"no comments feed for {post_id}", status=403)
+        self.counts["ok"] += 1
+        return super().comments(post_id, limit, depth, min_score)
+
+
+def test_sweep_records_request_counts_and_skips_unavailable_threads():
+    listing = [_dated_post(f"p{i}", "quiet", 1_700_000_000 + i) for i in range(3)]
+    client = CountingRssClient(
+        listings={"nursing": listing},
+        comments={"t3_p1": [_comment("c1", "nursing", "a reply", "t3_p1")]},
+        unavailable={"t3_p2"},
+    )
+    client.counts["ok"] = 5  # requests made before this sweep must not count
+    store = FakeStore()
+    result = scrape.sweep(_quiet_profile(), client, store, log=lambda _m: None)
+
+    assert client.comment_calls == ["t3_p2", "t3_p1"]
+    assert result.threads_deep_fetched == 1  # the 403 thread is not counted
+    assert result.requests == {"ok": 2, "http_403": 1, "http_429": 1, "other": 0}
+    assert store.sweeps[-1].as_dict()["requests"] == result.requests
+
+
+def test_request_counts_are_saved_in_the_store_sweeps_table(tmp_path):
+    import json
+
+    from prospector.store import Store
+
+    listing = [_dated_post("p0", "quiet", 1_700_000_000)]
+    client = CountingRssClient(listings={"nursing": listing})
+    store = Store(tmp_path / "s.db")
+    result = scrape.sweep(_quiet_profile(rss_comment_threads=0), client, store, log=lambda _m: None)
+    row = store.conn.execute("SELECT stats FROM sweeps WHERE run_id = ?", (result.run_id,)).fetchone()
+    assert json.loads(row[0])["requests"] == {"ok": 1, "http_403": 0, "http_429": 1, "other": 0}
+    store.close()

@@ -125,6 +125,11 @@ def _print_sweep_summary(result: SweepResult) -> None:
     typer.echo(f"  comments collected: {result.comments_collected}")
     typer.echo(f"  threads deep-read:  {result.threads_deep_fetched}")
     typer.echo(f"  duration:           {duration}s")
+    if result.requests:
+        typer.echo(
+            "  requests:           "
+            + ", ".join(f"{k} {v}" for k, v in result.requests.items())
+        )
     if result.subreddits:
         typer.echo("  per-subreddit:")
         for sub, count in sorted(result.subreddits.items(), key=lambda kv: (-kv[1], kv[0])):
@@ -309,11 +314,14 @@ def sweep(
         result = scrape.sweep(prof, client, store, **sweep_kwargs)
         _print_sweep_summary(result)
         rss = getattr(client, "_rss", None)
+        req = result.requests or {}
         typer.echo(
             f"fetched={result.posts_collected + result.comments_collected} "
             f"posts={result.posts_collected} comments={result.comments_collected} "
             f"transport={getattr(client, 'transport_in_use', 'json')} "
-            f"rss_requests={getattr(rss, 'requests_made', 0)}"
+            f"rss_requests={getattr(rss, 'requests_made', 0)} "
+            f"requests_ok={req.get('ok', 0)} requests_403={req.get('http_403', 0)} "
+            f"requests_429={req.get('http_429', 0)} requests_other={req.get('other', 0)}"
         )
     finally:
         store.close()

@@ -32,7 +32,7 @@ Insight is the client's job: Claude via MCP, or an optional built-in `--analyze`
 
 ## ✨ Features
 - **Reddit `.json` client** — listings, in-sub search, and comment trees; descriptive User-Agent, `429` Retry-After backoff, on-disk response cache. Optional free OAuth (env vars) lifts the rate limit ~10×.
-- **RSS fallback**: when `.json` returns HTTP 403, the client reads the public Atom feeds on `www.reddit.com` for the rest of the run. It keeps at least 20 seconds between requests and obeys the `x-ratelimit-*` headers. On 2026-10-04 the measured budget from a home IP was one request per minute. Feeds carry no vote score and no comment count, so those fields are 0 on this path.
+- **RSS fallback**: when `.json` returns HTTP 403, the client reads the public Atom feeds on `www.reddit.com` for the rest of the run. It keeps at least 20 seconds between requests and obeys the `x-ratelimit-*` headers. On 2026-10-04 the measured budget from a home IP was one request per minute. Feeds carry no vote score and no comment count, so those fields are 0 on this path. On RSS the sweep reads the comments of at least 10 threads per profile (`rss_comment_threads` in the profile, or `--rss-comment-threads`), chosen by pain score and then by recency.
 - **Semantic search and clusters** (optional `[semantic]` extra): `BAAI/bge-small-en-v1.5` vectors (fastembed, CPU) in a `sqlite-vec` table in the same SQLite file. `semantic-search` finds posts and comments by meaning. `clusters` groups items by meaning and shows each group's size, keywords and nearest quotes. Every hit and every example is a stored item with its permalink and a verbatim quote.
 - **Retention and deletion**: `prune` deletes items posted more than 7 days ago (configurable), items that now read `[deleted]` or `[removed]`, and items that Reddit returns as deleted or no longer has (`/api/info`, 100 ids per request). Their lexicon matches and vectors go too, and old response-cache files are purged.
 - **Two-stage scrape** — a broad, cheap post sweep, then comment trees fetched *only* for threads that clear the pain threshold or run hot. Spends the rate-limit budget where the signal is.
@@ -75,7 +75,8 @@ or missing store prints `[]` and exits 0.
 ### Daily run on a server
 `deploy/prospector-daily.sh` runs `sweep` for each profile, then `embed`, then `prune`,
 then one search check, and prints `daily: fetched=N embedded=N pruned=N searched=N`. The
-prune step runs even when a sweep fails. `deploy/install-systemd.sh` installs it as the
+prune step runs even when a sweep fails. At one RSS request per minute, one profile with 14
+subreddits takes about 28 minutes for posts plus about 10 minutes for 10 comment threads. `deploy/install-systemd.sh` installs it as the
 user units `prospector-sweep.service` and `prospector-sweep.timer` (daily at 09:20, with
 `MemoryMax=2G`). Keep the store outside the checkout (default `~/prospector-data`).
 Machine-local settings, such as `PROSPECTOR_SWEEP_PROFILES`, go in
@@ -110,7 +111,7 @@ report renderer enforces the evidence contract, so every claimed gap is traceabl
 Reddit permalinks and quotes.
 
 ## 🗺 Roadmap
-Code complete and verified locally — **145 offline unit tests pass**, all modules import, the CLI and
+Code complete and verified locally — **149 offline unit tests pass**, all modules import, the CLI and
 the full two-stage sweep run end to end, and all 11 MCP tools register. Built with a frozen
 interface contract (`INTERFACES.md`) so the modules integrate cleanly.
 

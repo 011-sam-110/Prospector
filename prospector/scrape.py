@@ -71,6 +71,7 @@ def sweep(
     max_threads: Optional[int] = None,
     log: Callable[[str], object] = print,
     combine_terms: bool = False,
+    rss_comment_threads: Optional[int] = None,
 ) -> SweepResult:
     """Run a full two-stage sweep for ``profile`` and return a :class:`SweepResult`.
 
@@ -93,6 +94,12 @@ def sweep(
         combine_terms: When ``True``, stage 1 sends ONE search per subreddit
             with all search terms joined by ``OR`` (see :func:`combined_query`)
             in place of one search per term.
+        rss_comment_threads: Override the profile's ``rss_comment_threads``.
+            On the RSS transport the feeds carry no comment counts, so the
+            "busy thread" rule cannot fire and few posts clear the pain
+            threshold. Stage 2 then reads at least this many threads: the
+            threshold candidates first, then the next posts by pain score,
+            newest first on a tie. The ``.json`` path ignores this setting.
 
     Returns:
         A :class:`SweepResult` with post/comment counts, per-subreddit tallies
@@ -192,6 +199,28 @@ def sweep(
     # Highest pain first; busy-but-low-pain threads fall to the back.
     candidates.sort(key=lambda it: (it.pain_score, it.num_comments), reverse=True)
     candidates = candidates[: thread_budget if thread_budget and thread_budget > 0 else 0]
+
+    if getattr(client, "using_rss", False):
+        # RSS has no comment counts: rank by pain, then by recency, and make
+        # sure at least ``floor`` threads are read.
+        floor = (
+            rss_comment_threads
+            if rss_comment_threads is not None
+            else profile.rss_comment_threads
+        )
+        chosen = {it.id for it in candidates}
+        ranked = sorted(
+            posts.values(),
+            key=lambda it: (it.pain_score, it.created_utc),
+            reverse=True,
+        )
+        candidates.sort(key=lambda it: (it.pain_score, it.created_utc), reverse=True)
+        for it in ranked:
+            if len(candidates) >= max(0, int(floor)):
+                break
+            if it.id not in chosen:
+                candidates.append(it)
+                chosen.add(it.id)
 
     threads_deep_fetched = 0
     cc = profile.comments

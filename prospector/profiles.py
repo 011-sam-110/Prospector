@@ -95,6 +95,7 @@ def _profile_from_dict(data: dict) -> Profile:
         pain_threshold=float(data.get("pain_threshold", 3.0)),
         evidence=evidence,
         comments=comments,
+        rss_comment_threads=int(data.get("rss_comment_threads", 10)),
     )
 
 

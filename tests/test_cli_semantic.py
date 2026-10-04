@@ -146,9 +146,14 @@ def test_sweep_passes_combine_terms_and_prints_fetched(monkeypatch, tmp_path):
     monkeypatch.setattr(cli, "RedditClient", _Client)
     monkeypatch.setattr(cli.scrape, "sweep", fake_sweep)
     result = runner.invoke(
-        app, ["sweep", "demo", "--db", str(tmp_path / "x.db"), "--combine-terms", "--transport", "rss"]
+        app,
+        [
+            "sweep", "demo", "--db", str(tmp_path / "x.db"), "--combine-terms",
+            "--transport", "rss", "--rss-comment-threads", "3",
+        ],
     )
     assert result.exit_code == 0, result.output
     assert captured["combine_terms"] is True
+    assert captured["rss_comment_threads"] == 3
     assert captured["client"].kwargs["transport"] == "rss"
     assert "fetched=10 posts=4 comments=6 transport=rss" in result.stdout

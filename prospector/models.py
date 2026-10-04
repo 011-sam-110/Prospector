@@ -135,6 +135,9 @@ class Profile:
     pain_threshold: float = 3.0
     evidence: EvidenceThresholds = field(default_factory=EvidenceThresholds)
     comments: CommentConfig = field(default_factory=CommentConfig)
+    #: On the RSS transport (no comment counts), stage 2 reads the comments of
+    #: at least this many posts, ranked by pain score, then by recency.
+    rss_comment_threads: int = 10
 
 
 # --------------------------------------------------------------------------- #

@@ -63,6 +63,7 @@ General rules for all agents:
     time_window="year"; listing_limit=100; max_threads=60
     pain_lexicon: list[LexiconRule]; pain_threshold=3.0
     evidence: EvidenceThresholds; comments: CommentConfig
+    rss_comment_threads=10        # added in 0.2: RSS stage-2 thread floor
 @dataclass EvidenceItem:
     id; permalink; quote; subreddit; author; score; created_utc
 @dataclass SweepResult:
@@ -223,7 +224,10 @@ def sweep(profile: Profile, client: RedditClient, store: Store,
           run_id: str | None = None, now: int | None = None,
           time_window: str | None = None, listing_limit: int | None = None,
           max_threads: int | None = None,
-          log=print) -> SweepResult:
+          log=print,
+          combine_terms: bool = False,              # added in 0.2
+          rss_comment_threads: int | None = None,   # added in 0.2
+          ) -> SweepResult:
     """
     Stage 1 (broad/cheap): for each sub in profile.subreddits, pull listing()
       (limit=listing_limit or profile.listing_limit) AND search() for each
@@ -234,6 +238,11 @@ def sweep(profile: Profile, client: RedditClient, store: Store,
       OR high num_comments; take up to (max_threads or profile.max_threads),
       ordered by pain_score desc. For each, client.comments(...) bounded by
       profile.comments. Score comments, upsert.
+    RSS transport (client.using_rss, added in 0.2): feeds carry no comment
+      counts, so stage 2 reads at least (rss_comment_threads or
+      profile.rss_comment_threads) threads: the threshold candidates first, then
+      the next posts by pain_score desc, created_utc desc. The .json path is
+      unchanged.
     Record + return a SweepResult (counts, per-sub tallies, top matched patterns).
     `run_id` defaults to uuid4().hex; `now` to int(time.time()). Be resilient:
     one sub failing must not abort the sweep (catch, log, continue).
@@ -363,6 +372,7 @@ prospector export  PROFILE --format json|csv|md [--out PATH] [--db ...]
 prospector mcp                      # exec the MCP server (calls mcp_server.main())
 # added in 0.2
 prospector sweep   PROFILE ... [--transport auto|json|rss] [--combine-terms]
+                           [--rss-comment-threads N]
 prospector embed   [--db ...] [--batch-size 64] [--limit N]
 prospector semantic-search "QUERY" [--db ...] [--limit 10] [--sub X]
                            [--since-days D] [--json]

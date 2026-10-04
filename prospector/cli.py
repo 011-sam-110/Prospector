@@ -269,6 +269,11 @@ def sweep(
         "--combine-terms",
         help="One OR-joined search per subreddit in place of one per term.",
     ),
+    rss_comment_threads: Optional[int] = typer.Option(
+        None,
+        "--rss-comment-threads",
+        help="On RSS, read the comments of at least N threads (profile default 10).",
+    ),
 ) -> None:
     """Run the two-stage Reddit sweep for PROFILE and store the scored results."""
     _check_transport(transport)
@@ -299,6 +304,8 @@ def sweep(
         )
         if combine_terms:
             sweep_kwargs["combine_terms"] = True
+        if rss_comment_threads is not None:
+            sweep_kwargs["rss_comment_threads"] = rss_comment_threads
         result = scrape.sweep(prof, client, store, **sweep_kwargs)
         _print_sweep_summary(result)
         rss = getattr(client, "_rss", None)

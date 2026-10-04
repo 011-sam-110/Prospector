@@ -383,6 +383,85 @@ def reddit_export(
 
 
 # --------------------------------------------------------------------------- #
+# Tools - semantic layer (no network; needs the [semantic] extra)              #
+# --------------------------------------------------------------------------- #
+def _since_days(days: float) -> Optional[int]:
+    if not days or days <= 0:
+        return None
+    return _now() - int(float(days) * 86400)
+
+
+def _semantic():
+    """Import the semantic layer, or raise a clear error naming the extra."""
+    from prospector import semantic
+
+    return semantic
+
+
+@mcp.tool
+def reddit_semantic_search(
+    query: str,
+    limit: int = 10,
+    subreddit: str = "",
+    since_days: float = 0.0,
+) -> list[dict]:
+    """Find stored posts and comments by MEANING, not exact words (no network).
+
+    Searches the vectors that ``prospector embed`` wrote (model
+    BAAI/bge-small-en-v1.5). Each hit has ``permalink``, ``subreddit``,
+    ``title``, a verbatim ``quote``, ``created_utc``, ``id``, ``kind`` and
+    ``score`` (cosine similarity to the query, higher is closer; NOT the Reddit
+    vote score). Cite a hit by its permalink and quote. ``subreddit`` and
+    ``since_days`` filter the hits. Returns [] when the store has no vectors.
+    """
+    semantic = _semantic()
+    conn = get_store().conn
+    try:
+        if not semantic.has_vectors(conn):
+            return []
+        return semantic.search(
+            conn,
+            semantic.default_embedder(),
+            query,
+            limit=max(1, int(limit)),
+            subreddit=subreddit or None,
+            since=_since_days(since_days),
+        )
+    except semantic.SemanticUnavailable as exc:
+        raise RuntimeError(str(exc)) from exc
+
+
+@mcp.tool
+def reddit_clusters(
+    subreddit: str = "",
+    profile: str = "",
+    since_days: float = 0.0,
+    k: int = 0,
+    examples: int = 3,
+) -> list[dict]:
+    """Group stored items by meaning to show what a community talks about.
+
+    Returns clusters sorted by size. Each cluster has ``size``, ``share``,
+    distinctive ``keywords``, a per-``subreddits`` count and ``examples``: the
+    items nearest the cluster centre, each with its permalink and verbatim quote.
+    ``k`` = number of clusters (0 = choose from the data). Filters:
+    ``subreddit``, ``profile``, ``since_days``. Returns [] when nothing matches.
+    """
+    semantic = _semantic()
+    try:
+        return semantic.clusters(
+            get_store().conn,
+            k=k or None,
+            subreddit=subreddit or None,
+            profile=profile or None,
+            since=_since_days(since_days),
+            examples=max(0, int(examples)),
+        )
+    except semantic.SemanticUnavailable as exc:
+        raise RuntimeError(str(exc)) from exc
+
+
+# --------------------------------------------------------------------------- #
 # Entry point                                                                  #
 # --------------------------------------------------------------------------- #
 def main() -> None:

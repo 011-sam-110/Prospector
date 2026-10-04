@@ -9,7 +9,10 @@ The engine's "fetch hands". Everything here is deliberately conservative:
     offline-friendly, and
   * optional OAuth (client-credentials) — when app credentials are present we
     talk to ``oauth.reddit.com`` with a higher rate budget, otherwise we use the
-    anonymous ``www.reddit.com`` ``.json`` endpoints.
+    anonymous ``www.reddit.com`` ``.json`` endpoints, and
+  * an RSS fallback (``transport="auto"``, the default): when a ``.json``
+    request gets HTTP 403, the client reads the public Atom feeds through
+    :class:`prospector.reddit_rss.RssTransport` for the rest of the run.
 
 The public surface (``RedditClient`` + :class:`RedditError`) is the frozen
 contract in ``INTERFACES.md``; do not change a signature without updating it.
@@ -20,13 +23,34 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sys
 import time
 from pathlib import Path
-from typing import Optional, Union
+from typing import Callable, Optional, Union
 
 import httpx
 
-DEFAULT_USER_AGENT = "prospector/0.1 (+https://github.com/011-sam-110/Prospector)"
+from prospector.errors import RedditError
+from prospector.reddit_rss import DEFAULT_RSS_INTERVAL, INFO_BATCH, RssTransport
+
+__all__ = [
+    "DEFAULT_USER_AGENT",
+    "PUBLIC_BASE",
+    "OAUTH_BASE",
+    "TOKEN_URL",
+    "TRANSPORTS",
+    "default_cache_dir",
+    "RedditClient",
+    "RedditError",
+]
+
+#: Honest, descriptive User-Agent: what the tool is and where its code lives.
+DEFAULT_USER_AGENT = (
+    "python:prospector:0.2 (personal research; +https://github.com/011-sam-110/Prospector)"
+)
+
+#: ``auto`` = ``.json`` first, RSS after a 403. ``json`` / ``rss`` = one only.
+TRANSPORTS = ("auto", "json", "rss")
 
 #: Anonymous public JSON host.
 PUBLIC_BASE = "https://www.reddit.com"
@@ -39,9 +63,12 @@ TOKEN_URL = "https://www.reddit.com/api/v1/access_token"
 _RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
 
 
-class RedditError(Exception):
-    """Raised on a hard failure: exhausted retries, a non-JSON/blocked HTML
-    response, an OAuth failure, or an error body Reddit returns inline."""
+def default_cache_dir() -> Path:
+    """Response-cache folder: ``PROSPECTOR_CACHE_DIR``, else ``./.cache/reddit``."""
+    env = os.environ.get("PROSPECTOR_CACHE_DIR")
+    if env:
+        return Path(env)
+    return Path.cwd() / ".cache" / "reddit"
 
 
 class RedditClient:
@@ -52,7 +79,8 @@ class RedditClient:
     user_agent:
         Sent on every request — Reddit blocks generic / missing agents.
     cache_dir:
-        Directory for the on-disk JSON cache. Defaults to ``./.cache/reddit``.
+        Directory for the on-disk JSON cache. Defaults to the
+        ``PROSPECTOR_CACHE_DIR`` environment variable, else ``./.cache/reddit``.
     cache_ttl:
         Cache lifetime in seconds. ``0`` disables the cache entirely.
     client_id / client_secret:
@@ -63,6 +91,15 @@ class RedditClient:
         anonymous, ``0.6`` when OAuth credentials are present.
     timeout:
         Per-request timeout in seconds.
+    transport:
+        ``"auto"`` (default): use ``.json`` and switch to the RSS feeds after
+        the first HTTP 403 or block page. ``"json"``: never use RSS.
+        ``"rss"``: use only the RSS feeds.
+    rss_interval:
+        Minimum seconds between RSS requests (default 20). The feed rate-limit
+        headers can make the real gap longer.
+    log:
+        Where the one-line transport-switch notice goes (default: stderr).
     """
 
     #: Hard ceiling for any single backoff / Retry-After sleep.
@@ -79,16 +116,26 @@ class RedditClient:
         client_secret: Optional[str] = None,
         min_interval: Optional[float] = None,
         timeout: float = 20.0,
+        transport: str = "auto",
+        rss_interval: Optional[float] = None,
+        log: Optional[Callable[[str], object]] = None,
     ) -> None:
         self.user_agent = user_agent or DEFAULT_USER_AGENT
         self.cache_ttl = int(cache_ttl)
         self.timeout = float(timeout)
-
-        self.cache_dir = (
-            Path(cache_dir)
-            if cache_dir is not None
-            else Path.cwd() / ".cache" / "reddit"
+        if transport not in TRANSPORTS:
+            raise ValueError(
+                f"transport must be one of {', '.join(TRANSPORTS)}, got {transport!r}"
+            )
+        self.transport = transport
+        self.rss_interval = (
+            float(rss_interval) if rss_interval is not None else DEFAULT_RSS_INTERVAL
         )
+        self._log = log or (lambda message: print(message, file=sys.stderr))
+        self._rss: Optional[RssTransport] = None
+        self._using_rss = transport == "rss"
+
+        self.cache_dir = Path(cache_dir) if cache_dir is not None else default_cache_dir()
 
         # Credentials: explicit args win, else environment.
         self._client_id = client_id or os.environ.get("REDDIT_CLIENT_ID") or None
@@ -250,7 +297,8 @@ class RedditClient:
                 if attempt >= self._MAX_RETRIES:
                     raise RedditError(
                         f"Reddit returned HTTP {status} for {path} "
-                        f"after {attempt + 1} attempts"
+                        f"after {attempt + 1} attempts",
+                        status=status,
                     )
                 retry_after = self._retry_after(resp)
                 wait = retry_after if retry_after is not None else backoff
@@ -261,7 +309,8 @@ class RedditClient:
             if status >= 400:
                 raise RedditError(
                     f"Reddit returned HTTP {status} for {path}: "
-                    f"{self._snippet(resp)}"
+                    f"{self._snippet(resp)}",
+                    status=status,
                 )
 
             data = self._parse(resp, path)
@@ -300,7 +349,9 @@ class RedditClient:
                 or "whoa there" in text
             ):
                 raise RedditError(
-                    f"Blocked / non-JSON (HTML) response from Reddit for {path}"
+                    f"Blocked / non-JSON (HTML) response from Reddit for {path}",
+                    status=getattr(resp, "status_code", None),
+                    blocked=True,
                 ) from exc
             raise RedditError(f"Invalid JSON from Reddit for {path}") from exc
 
@@ -391,6 +442,59 @@ class RedditClient:
             pass
 
     # ------------------------------------------------------------------ #
+    # Transport selection (.json first, RSS after a 403)
+    # ------------------------------------------------------------------ #
+    @property
+    def rss(self) -> RssTransport:
+        """The RSS transport, built on first use with this client's User-Agent."""
+        if self._rss is None:
+            self._rss = RssTransport(
+                self.user_agent,
+                min_interval=self.rss_interval,
+                timeout=max(self.timeout, 30.0),
+                log=self._log,
+            )
+        return self._rss
+
+    @property
+    def using_rss(self) -> bool:
+        """``True`` once the client reads the RSS feeds (forced or after a 403)."""
+        return self._using_rss
+
+    @property
+    def transport_in_use(self) -> str:
+        """``"rss"`` or ``"json"``: the transport the next request will use."""
+        return "rss" if self._using_rss else "json"
+
+    def _dispatch(self, json_call: Callable[[], list], rss_call: Callable[[], list]) -> list:
+        """Run ``json_call``. In ``auto`` mode a 403 or a block page switches
+        this client to RSS for the rest of its life, then runs ``rss_call``."""
+        if self._using_rss:
+            return rss_call()
+        try:
+            return json_call()
+        except RedditError as exc:
+            if self.transport == "auto" and (exc.status == 403 or exc.blocked):
+                self._using_rss = True
+                self._log(
+                    "[reddit] the .json endpoint was refused "
+                    f"({exc.status or 'block page'}); using the RSS feeds for the rest "
+                    "of this run"
+                )
+                return rss_call()
+            raise
+
+    def _rss_cached(self, endpoint: str, args: dict, call: Callable[[], list]) -> list:
+        """Run an RSS ``call`` through the same on-disk cache as ``get_json``."""
+        cache_path = self._cache_path(f"rss:{endpoint}", args)
+        cached = self._read_cache(cache_path)
+        if cached is not None:
+            return cached
+        data = call()
+        self._write_cache(cache_path, data)
+        return data
+
+    # ------------------------------------------------------------------ #
     # High-level endpoints
     # ------------------------------------------------------------------ #
     def listing(
@@ -404,8 +508,106 @@ class RedditClient:
         """Return a flat list of raw post ``data`` dicts (the inner ``t3`` data).
 
         Pulls ``/r/<subreddit>/<sort>.json`` and follows the ``after`` token for
-        up to ``pages`` pages of (at most 100) posts each.
+        up to ``pages`` pages of (at most 100) posts each. After a 403 in
+        ``auto`` mode the same posts come from ``/r/<subreddit>/<sort>/.rss``.
         """
+        args = {"subreddit": subreddit, "sort": sort, "limit": limit,
+                "time_filter": time_filter, "pages": pages}
+        return self._dispatch(
+            lambda: self._listing_json(subreddit, sort, limit, time_filter, pages),
+            lambda: self._rss_cached(
+                "listing", args,
+                lambda: self.rss.listing(subreddit, sort, limit, time_filter, pages),
+            ),
+        )
+
+    def search(
+        self,
+        query: str,
+        subreddit: Optional[str] = None,
+        sort: str = "relevance",
+        time_filter: str = "year",
+        limit: int = 100,
+        restrict_sr: bool = True,
+    ) -> list[dict]:
+        """Return raw post ``data`` dicts from ``search.json`` (or ``search.rss``).
+
+        When ``subreddit`` is given the search is scoped to that sub (subject to
+        ``restrict_sr``); otherwise it is a site-wide link search.
+        """
+        args = {"query": query, "subreddit": subreddit, "sort": sort,
+                "time_filter": time_filter, "limit": limit, "restrict_sr": restrict_sr}
+        return self._dispatch(
+            lambda: self._search_json(query, subreddit, sort, time_filter, limit, restrict_sr),
+            lambda: self._rss_cached(
+                "search", args,
+                lambda: self.rss.search(query, subreddit, sort, time_filter, limit, restrict_sr),
+            ),
+        )
+
+    def comments(
+        self,
+        post_id: str,
+        limit: int = 100,
+        depth: int = 2,
+        min_score: int = 0,
+    ) -> list[dict]:
+        """Fetch a post's comment tree and return a FLAT list of comment ``data``.
+
+        Walks ``/comments/<id>.json`` up to ``depth`` levels, skipping ``more``
+        stubs and dropping comments below ``min_score`` (kept comments still let
+        the walk descend into their replies). ``post_id`` may be a fullname
+        (``t3_abc``) or a bare id (``abc``). The RSS feed has no scores and no
+        tree, so over RSS ``min_score`` and ``depth`` have no effect.
+        """
+        args = {"post_id": post_id, "limit": limit, "depth": depth, "min_score": min_score}
+        return self._dispatch(
+            lambda: self._comments_json(post_id, limit, depth, min_score),
+            lambda: self._rss_cached(
+                "comments", args,
+                lambda: self.rss.comments(post_id, limit, depth, min_score),
+            ),
+        )
+
+    def info(self, fullnames: list[str]) -> list[dict]:
+        """Return the CURRENT ``data`` of up to 100 posts/comments by fullname.
+
+        Uses ``/api/info.json`` (or ``/api/info.rss`` after a 403) and never the
+        cache, because the prune step needs the live state. Reddit leaves out
+        ids that no longer exist, and returns deleted or removed items with
+        ``[deleted]`` / ``[removed]`` text.
+        """
+        names = [n for n in dict.fromkeys(fullnames) if n]
+        if not names:
+            return []
+        if len(names) > INFO_BATCH:
+            raise ValueError(f"info() takes at most {INFO_BATCH} ids, got {len(names)}")
+        return self._dispatch(
+            lambda: self._info_json(names),
+            lambda: self.rss.info(names),
+        )
+
+    def _info_json(self, names: list[str]) -> list[dict]:
+        data = self._fetch("/api/info.json", {"id": ",".join(names)})
+        children = ((data or {}).get("data") or {}).get("children") or []
+        return [
+            child["data"]
+            for child in children
+            if child.get("kind") in ("t1", "t3") and isinstance(child.get("data"), dict)
+        ]
+
+    # ------------------------------------------------------------------ #
+    # .json implementations
+    # ------------------------------------------------------------------ #
+    def _listing_json(
+        self,
+        subreddit: str,
+        sort: str = "new",
+        limit: int = 100,
+        time_filter: str = "year",
+        pages: int = 1,
+    ) -> list[dict]:
+        """``.json`` implementation of :meth:`listing`."""
         per_page = max(1, min(int(limit), 100))
         path = f"/r/{subreddit}/{sort}.json"
         out: list[dict] = []
@@ -426,7 +628,7 @@ class RedditClient:
                 break
         return out
 
-    def search(
+    def _search_json(
         self,
         query: str,
         subreddit: Optional[str] = None,
@@ -435,11 +637,7 @@ class RedditClient:
         limit: int = 100,
         restrict_sr: bool = True,
     ) -> list[dict]:
-        """Return raw post ``data`` dicts from ``search.json``.
-
-        When ``subreddit`` is given the search is scoped to that sub (subject to
-        ``restrict_sr``); otherwise it is a site-wide link search.
-        """
+        """``.json`` implementation of :meth:`search`."""
         params: dict = {
             "q": query,
             "sort": sort,
@@ -460,20 +658,14 @@ class RedditClient:
             if child.get("kind") == "t3" and isinstance(child.get("data"), dict)
         ]
 
-    def comments(
+    def _comments_json(
         self,
         post_id: str,
         limit: int = 100,
         depth: int = 2,
         min_score: int = 0,
     ) -> list[dict]:
-        """Fetch a post's comment tree and return a FLAT list of comment ``data``.
-
-        Walks ``/comments/<id>.json`` up to ``depth`` levels, skipping ``more``
-        stubs and dropping comments below ``min_score`` (kept comments still let
-        the walk descend into their replies). ``post_id`` may be a fullname
-        (``t3_abc``) or a bare id (``abc``).
-        """
+        """``.json`` implementation of :meth:`comments`."""
         bare = post_id.split("_", 1)[1] if post_id.startswith("t3_") else post_id
         params = {"limit": int(limit), "depth": int(depth)}
         data = self.get_json(f"/comments/{bare}.json", params)
@@ -519,11 +711,13 @@ class RedditClient:
     # Lifecycle
     # ------------------------------------------------------------------ #
     def close(self) -> None:
-        """Close the underlying HTTP connection pool."""
+        """Close the underlying HTTP connection pools."""
         try:
             self._http.close()
         except Exception:  # pragma: no cover - best-effort cleanup
             pass
+        if self._rss is not None:
+            self._rss.close()
 
     def __enter__(self) -> "RedditClient":
         return self

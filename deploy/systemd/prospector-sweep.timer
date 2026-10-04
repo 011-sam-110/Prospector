@@ -1,0 +1,12 @@
+# Fires prospector-sweep.service once a day at 09:20 local time.
+# 09:20 keeps clear of the 03:00 job on the same box (it runs to about 06:00).
+
+[Unit]
+Description=Daily Prospector Reddit sweep
+
+[Timer]
+OnCalendar=*-*-* 09:20:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

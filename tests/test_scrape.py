@@ -321,3 +321,32 @@ def test_empty_profile_returns_zeroed_result():
 
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+# --------------------------------------------------------------------------- #
+# combine_terms (one OR-joined search per subreddit)                           #
+# --------------------------------------------------------------------------- #
+def test_combined_query_quotes_and_joins_terms():
+    assert scrape.combined_query(["i wish there was", "fax", "  still   fax "]) == (
+        '"i wish there was" OR "fax" OR "still fax"'
+    )
+    assert scrape.combined_query(['say "hi"']) == '"say hi"'
+
+
+def test_combine_terms_sends_one_search_per_subreddit():
+    prof = Profile(
+        name="multi",
+        description="",
+        subreddits=["nursing", "medicine"],
+        search_terms=["fax", "pager", "i wish there was"],
+    )
+    client = FakeClient()
+    scrape.sweep(prof, client, FakeStore(), log=lambda _m: None, combine_terms=True)
+    assert client.search_calls == [
+        ('"fax" OR "pager" OR "i wish there was"', "nursing"),
+        ('"fax" OR "pager" OR "i wish there was"', "medicine"),
+    ]
+
+    plain = FakeClient()
+    scrape.sweep(prof, plain, FakeStore(), log=lambda _m: None)
+    assert len(plain.search_calls) == 6  # default: one search per term per sub

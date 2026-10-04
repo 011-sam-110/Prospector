@@ -1,0 +1,24 @@
+# Prospector daily run: sweep, then embed, then prune (user unit).
+# Install: deploy/install-systemd.sh. Start by hand:
+#   systemctl --user start prospector-sweep.service
+# Logs: journalctl --user -u prospector-sweep.service
+
+[Unit]
+Description=Prospector daily Reddit sweep (sweep -> embed -> prune)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/prospector
+Environment=PYTHONUNBUFFERED=1
+Environment=PROSPECTOR_HOME=%h/prospector
+Environment=PROSPECTOR_DATA=%h/prospector-data
+Environment=PROSPECTOR_EMBED_THREADS=4
+# Machine-local settings (profiles to sweep, an extra profiles folder) live
+# outside the checkout. The leading "-" makes the file optional.
+EnvironmentFile=-%h/prospector-data/prospector.env
+ExecStart=/usr/bin/env bash %h/prospector/deploy/prospector-daily.sh
+# The RSS feeds allow about one request per minute, so a run takes hours.
+TimeoutStartSec=12h
+MemoryMax=2G
+Nice=10
